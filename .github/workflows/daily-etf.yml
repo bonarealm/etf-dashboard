@@ -1,0 +1,71 @@
+name: Daily ETF dashboard
+
+"on":
+  schedule:
+    # 8:30 北京时间，周一至周五（UTC 0:30）
+    - cron: '30 0 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install fonts and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          pip install --upgrade pip
+          pip install pandas numpy matplotlib requests
+
+      - name: Generate dashboard
+        run: |
+          python etf_system.py --out-dir output
+          ls -lh output/
+          python - << 'PY'
+          import json, sys
+          d = json.load(open('output/latest.json'))
+          assert d['pool_size'] >= 15, f"pool too small: {d['pool_size']}"
+          assert d['backtest'], "backtest missing"
+          assert d['top5'], "top5 missing"
+          assert not any(t['signal'] == '卖出/规避' for t in d['top5']), "TOP5 contains sell signal"
+          print(f"as_of={d['as_of']} pool={d['pool_size']} top5={[t['code'] for t in d['top5']]} index_missing={d.get('index_missing')}")
+          PY
+
+      - name: Skip if no new trading-day data
+        id: check
+        run: |
+          python - << 'PY'
+          import json, os, re, pathlib
+          new = json.load(open('output/latest.json'))
+          old_html = pathlib.Path('index.html').read_text(encoding='utf-8', errors='ignore') if pathlib.Path('index.html').exists() else ''
+          m = re.search(r'数据截至：(\d{4}-\d{2}-\d{2})', old_html)
+          old_asof = m.group(1) if m else ''
+          # 手动触发时强制发布，用于测试提交流程；定时运行时如数据截至日未变（节假日/无新数据），跳过提交
+          skip = 'false' if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' else ('true' if old_asof == new['as_of'] else 'false')
+          print(f"old_asof={old_asof} new_asof={new['as_of']} skip={skip}")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"skip={skip}\n")
+          PY
+
+      - name: Publish to Pages
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          cp output/dashboard.html index.html
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git diff --cached --quiet && echo "no change, skip commit" || (git commit -m "更新A股ETF每日看板" && git push)
