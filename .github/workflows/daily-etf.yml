@@ -33,7 +33,7 @@ jobs:
 
       - name: Generate dashboard
         run: |
-          python etf_system.py --out-dir output
+          python -u etf_system.py --out-dir output
           ls -lh output/
           python - << 'PY'
           import json, sys
