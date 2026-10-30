@@ -14,13 +14,13 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -38,7 +38,9 @@ jobs:
           python - << 'PY'
           import json, sys
           d = json.load(open('output/latest.json'))
-          assert d['pool_size'] >= 15, f"pool too small: {d['pool_size']}"
+          assert d['pool_size'] == 20, f"pool not full: {d['pool_size']}"
+          assert d['missing'] == [], f"missing ETFs: {d['missing']}"
+          assert d.get('index_missing') == [], f"missing indices: {d.get('index_missing')}"
           assert d['backtest'], "backtest missing"
           assert d['top5'], "top5 missing"
           assert not any(t['signal'] == '卖出/规避' for t in d['top5']), "TOP5 contains sell signal"
@@ -67,5 +69,5 @@ jobs:
           cp output/dashboard.html index.html
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.html
+          git add index.html data
           git diff --cached --quiet && echo "no change, skip commit" || (git commit -m "更新A股ETF每日看板" && git push)
