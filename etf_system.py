@@ -274,14 +274,19 @@ def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None, my=None):
     strat = np.array(bt["strategy_curve"], dtype=float)
     bench = np.array(bt["benchmark_curve"], dtype=float)
     out = {}
-    # 1. 回测净值
-    fig, ax = plt.subplots(figsize=(10, 3.6))
-    ax.plot(dates, strat, color=NAVY, linewidth=2.2, label=f"TOP5策略（终值 {strat[-1]:.1f}）")
-    ax.plot(dates, bench, color=GREY, linewidth=1.8, label=f"沪深300ETF基准（终值 {bench[-1]:.1f}）")
-    ax.axhline(100, color=GOLD, linewidth=1.2, linestyle="--")
-    ax.fill_between(dates, strat, 100, where=(strat >= 100), color=NAVY, alpha=0.06)
-    _style_ax(ax, "回测净值走势（起点 = 100）")
-    ax.legend(frameon=False, fontsize=9, loc="best")
+    # 1. 回测净值：A股颜色，涨红跌绿，终值高于100为红、低于100为绿
+    fig, ax = plt.subplots(figsize=(10, 4.0))
+    strat_col = RED_UP if strat[-1] >= 100 else GREEN_DN
+    bench_col = RED_UP if bench[-1] >= 100 else GREEN_DN
+    ax.plot(dates, strat, color=strat_col, linewidth=3.0, label=f"TOP5策略（终值 {strat[-1]:.1f}）")
+    ax.plot(dates, bench, color=bench_col, linewidth=2.2, linestyle="--", label=f"沪深300ETF基准（终值 {bench[-1]:.1f}）")
+    ax.scatter([dates[-1]], [strat[-1]], color=strat_col, s=55, zorder=5)
+    ax.scatter([dates[-1]], [bench[-1]], color=bench_col, s=40, zorder=5)
+    ax.axhline(100, color="#344054", linewidth=1.5, linestyle="--")
+    ax.fill_between(dates, strat, 100, where=(strat >= 100), color=RED_UP, alpha=0.14)
+    ax.fill_between(dates, strat, 100, where=(strat < 100), color=GREEN_DN, alpha=0.14)
+    _style_ax(ax, "回测净值走势（起点 = 100，红涨绿跌）")
+    ax.legend(frameon=False, fontsize=10, loc="best")
     fig.autofmt_xdate(rotation=0)
     out["net"] = _png_b64(fig)
     # 2. 回撤
@@ -364,16 +369,19 @@ def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None, my=None):
         _style_ax(ax, "累计收益率走势对比（%）")
         ax.legend(frameon=False, fontsize=9, loc="best", ncol=2)
         out["bench_cmp"] = _png_b64(fig)
-    # 7b. 模拟账户总资产走势
+    # 7b. 模拟账户总资产走势：A股颜色，终值高于初始资金为红、低于为绿
     if sim:
         sdates = pd.to_datetime(sim["curve_dates"])
         sassets = np.array(sim["curve_assets"], dtype=float)
-        fig, ax = plt.subplots(figsize=(10, 3.6))
-        ax.plot(sdates, sassets, color=NAVY, linewidth=2.2, label=f"模拟账户总资产（终值 {sassets[-1]:,.0f}元）")
-        ax.axhline(sim["initial"], color=GOLD, linewidth=1.2, linestyle="--", label=f"初始资金 {sim['initial']:,.0f}元")
-        ax.fill_between(sdates, sassets, sim["initial"], where=(sassets >= sim["initial"]), color=NAVY, alpha=0.06)
-        _style_ax(ax, "模拟账户总资产走势（元）")
-        ax.legend(frameon=False, fontsize=9, loc="best")
+        sim_col = RED_UP if sassets[-1] >= sim["initial"] else GREEN_DN
+        fig, ax = plt.subplots(figsize=(10, 4.0))
+        ax.plot(sdates, sassets, color=sim_col, linewidth=3.0, label=f"模拟账户总资产（终值 {sassets[-1]:,.0f}元）")
+        ax.scatter([sdates[-1]], [sassets[-1]], color=sim_col, s=55, zorder=5)
+        ax.axhline(sim["initial"], color="#344054", linewidth=1.5, linestyle="--", label=f"初始资金 {sim['initial']:,.0f}元")
+        ax.fill_between(sdates, sassets, sim["initial"], where=(sassets >= sim["initial"]), color=RED_UP, alpha=0.16)
+        ax.fill_between(sdates, sassets, sim["initial"], where=(sassets < sim["initial"]), color=GREEN_DN, alpha=0.16)
+        _style_ax(ax, "模拟账户总资产走势（元，红涨绿跌）")
+        ax.legend(frameon=False, fontsize=10, loc="best")
         out["sim_assets"] = _png_b64(fig)
     # 7a. 我的持仓：归一化收益走势与单只盈亏率
     if my and my.get("rows"):
