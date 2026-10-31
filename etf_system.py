@@ -265,7 +265,7 @@ def _style_ax(ax, title):
         ax.spines[s].set_color("#D0D5DD")
     ax.tick_params(labelsize=9, colors="#475467")
 
-def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None):
+def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None, my=None):
     """返回 {net, drawdown, monthly, top5, daily, cumulative, bench_cmp, excess} 的 base64 PNG；无数据时为空。"""
     if not HAS_MPL or not bt:
         return {}
@@ -375,6 +375,30 @@ def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None):
         _style_ax(ax, "模拟账户总资产走势（元）")
         ax.legend(frameon=False, fontsize=9, loc="best")
         out["sim_assets"] = _png_b64(fig)
+    # 7a. 我的持仓：归一化收益走势与单只盈亏率
+    if my and my.get("rows"):
+        mdates = pd.to_datetime(my["curve_dates"])
+        mvals = np.array(my["curve_values"], dtype=float)
+        fig, ax = plt.subplots(figsize=(10, 3.8))
+        ax.plot(mdates, mvals, color=NAVY, linewidth=2.4, label=f"我的持仓组合（终值 {mvals[-1]:.1f}）")
+        _cols = ["#2E5AAC", "#E67E22", "#067647", "#7C3AED", "#B54708"]
+        for i, r in enumerate(my["rows"]):
+            rd = pd.to_datetime(r["curve_dates"])
+            rv = np.array(r["curve_norm"], dtype=float)
+            ax.plot(rd, rv, color=_cols[i % len(_cols)], linewidth=1.4, label=f"{r['code']} {r['name']}（{r['pnl_pct']*100:+.2f}%）")
+        ax.axhline(100, color=GOLD, linewidth=1.2, linestyle="--")
+        _style_ax(ax, "我的持仓收益走势（买入价 = 100，组合按成本加权）")
+        ax.legend(frameon=False, fontsize=9, loc="best")
+        out["my_curve"] = _png_b64(fig)
+        labels = [f"{r['code']}" for r in my["rows"]]
+        vals = [r["pnl_pct"] * 100 for r in my["rows"]]
+        fig, ax = plt.subplots(figsize=(10, 3.0))
+        ax.barh(labels, vals, color=[RED_UP if v >= 0 else GREEN_DN for v in vals], height=0.55)
+        ax.axvline(0, color="#344054", linewidth=1)
+        for i, v in enumerate(vals):
+            ax.text(v + (0.3 if v >= 0 else -0.3), i, f"{v:+.2f}%", va="center", ha="left" if v >= 0 else "right", fontsize=10, fontweight="bold", color=NAVY)
+        _style_ax(ax, "我的持仓单只盈亏率（买入以来，%）")
+        out["my_pnl"] = _png_b64(fig)
     # 7. 超额收益曲线：策略净值 - 沪深300ETF净值（百分点，红正蓝负）
     excess = strat - bench
     fig, ax = plt.subplots(figsize=(10, 3.4))
@@ -386,6 +410,112 @@ def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None):
     ax.legend(handles=[Patch(facecolor=RED_UP, label="超额为正：策略跑赢基准"), Patch(facecolor="#2E7DD1", label="超额为负：策略跑输基准")], frameon=False, fontsize=9, loc="best")
     out["excess"] = _png_b64(fig)
     return out
+
+
+def compute_my_holdings(session):
+    """我的持仓：读脚本目录下的 holdings.json，逐只抓行情，算买入以来收益与组合曲线。
+    口径：单只盈亏率 = 最新价/成本价 - 1；组合曲线按成本（港币按 hkd_cny 折人民币）加权，
+    买入前该只按成本价计（视为现金），买入后跟随市价；缺失且无缓存的标的剔除并在 missing 中注明，不编造价格。"""
+    import json as _json
+    path = os.path.join(BASE, "holdings.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        cfg = _json.load(open(path, encoding="utf-8"))
+    except Exception as e:
+        print(f"MY HOLDINGS config fail: {e}", file=sys.stderr)
+        return None
+    entries = cfg.get("holdings") or []
+    if not entries:
+        return None
+    rate = float(cfg.get("hkd_cny") or 0.92)
+    rows, missing, cached = [], [], []
+    for e in entries:
+        code = str(e.get("code", "")).strip()
+        market = str(e.get("market", "A股")).strip()
+        try:
+            shares = float(e.get("shares"))
+            buy_price = float(e.get("buy_price"))
+            buy_date = pd.to_datetime(e.get("buy_date")).date()
+        except Exception:
+            missing.append({"code": code, "label": market, "error": "holdings.json 字段不完整"})
+            continue
+        if market == "港股通":
+            secid = f"116.{code.zfill(5)}"
+            currency = "HKD"
+        else:
+            secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+            currency = "CNY"
+        cache_path = os.path.join(DATA_DIR, f"hold_{code}.csv")
+        try:
+            df, real_name = fetch_one(session, secid)
+            df.to_csv(cache_path, index=False)
+            print(f"MY OK {code} {real_name} rows={len(df)} last={df.iloc[-1]['date'].date()} close={df.iloc[-1]['close']}")
+        except Exception as ex:
+            if os.path.exists(cache_path):
+                try:
+                    df = pd.read_csv(cache_path, parse_dates=["date"])
+                    real_name = e.get("name", code)
+                    cached.append({"code": code, "label": market, "last": str(df.iloc[-1]['date'].date())})
+                    print(f"MY CACHED {code} rows={len(df)} last={df.iloc[-1]['date'].date()}")
+                except Exception as ce:
+                    missing.append({"code": code, "label": market, "error": str(ce)})
+                    continue
+            else:
+                missing.append({"code": code, "label": market, "error": str(ex)})
+                print(f"MY FAIL {code} {ex}", file=sys.stderr)
+                continue
+            time.sleep(0.4)
+        else:
+            time.sleep(0.4)
+        df = df.sort_values("date").reset_index(drop=True)
+        latest = df.iloc[-1]
+        price = float(latest["close"])
+        value = shares * price
+        cost = shares * buy_price
+        # 组合曲线用：从最早买入日到最新日的日历轴，买入前按成本价计
+        sub = df[df["date"].dt.date >= buy_date]
+        if sub.empty:
+            sub = df.iloc[-1:]
+        rows.append({
+            "code": code, "market": market, "currency": currency, "name": real_name or code,
+            "buy_date": str(buy_date), "shares": shares, "buy_price": buy_price,
+            "price": price, "latest_date": str(latest["date"].date()),
+            "value": value, "cost": cost, "pnl": value - cost,
+            "pnl_pct": (price / buy_price - 1) if buy_price else 0.0,
+            "days": (latest["date"].date() - buy_date).days,
+            "curve_dates": [str(d.date()) for d in sub["date"]],
+            "curve_norm": [float(c / buy_price * 100) for c in sub["close"]],
+        })
+    if not rows:
+        return {"simulated": bool(cfg.get("simulated")), "rows": [], "missing": missing, "cached": cached}
+    total_cost_cny = sum(r["cost"] * (rate if r["currency"] == "HKD" else 1.0) for r in rows)
+    total_value_cny = sum(r["value"] * (rate if r["currency"] == "HKD" else 1.0) for r in rows)
+    for r in rows:
+        r["weight"] = (r["cost"] * (rate if r["currency"] == "HKD" else 1.0) / total_cost_cny) if total_cost_cny else 0.0
+    # 组合曲线：日历轴为最早买入日到最新日，买入前按 100 计
+    all_dates = sorted(set(d for r in rows for d in r["curve_dates"]))
+    # 用每只的曲线做前向填充，得到组合加权净值
+    curve_vals = []
+    for d in all_dates:
+        tot = 0.0
+        for r in rows:
+            # 找到该日或之前最近的归一化值，买入前为 100
+            vals = [(cd, cv) for cd, cv in zip(r["curve_dates"], r["curve_norm"]) if cd <= d]
+            v = vals[-1][1] if vals else 100.0
+            tot += r["weight"] * v
+        curve_vals.append(round(float(tot), 2))
+    peak = np.maximum.accumulate(np.array(curve_vals, dtype=float))
+    max_dd = float((np.array(curve_vals) / peak * 100 - 100).min()) if curve_vals else 0.0
+    return {
+        "simulated": bool(cfg.get("simulated")), "hkd_cny": rate, "rows": rows,
+        "missing": missing, "cached": cached, "curve_dates": all_dates, "curve_values": curve_vals,
+        "total_cost_cny": total_cost_cny, "total_value_cny": total_value_cny,
+        "total_pnl_cny": total_value_cny - total_cost_cny,
+        "total_pnl_pct": (total_value_cny / total_cost_cny - 1) if total_cost_cny else 0.0,
+        "max_dd": max_dd / 100.0,
+        "start_date": min(r["buy_date"] for r in rows), "end_date": rows[0]["latest_date"],
+    }
 
 def simulate_account(frames, common_dates, latest_idx, bt, initial=200000.0):
     """20万元模拟账户：按每日TOP5信号（买入优先、持有补足、卖出不入选）等权调仓。
@@ -653,6 +783,7 @@ def main():
         "index_benchmarks": [{"code": icode, "name": iname, "cum": (bench_curves[icode][-1] / 100 if icode in bench_curves and bench_curves[icode] else None), "ret20": index_ret20.get(icode)} for _, icode, iname in INDEX_BENCHMARKS],
         "index_missing": index_missing,
         "sim_account": simulate_account(frames, common_dates, latest_idx, bt, initial=200000.0),
+        "my_holdings": compute_my_holdings(session),
     }
     with open(os.path.join(args.out_dir, "latest.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
@@ -676,7 +807,7 @@ def main():
     if result["sell_list"]:
         sell_text = "、".join([f"{s['code']}（{s['score']}分）" for s in result["sell_list"]])
     bt = result["backtest"]
-    charts = make_charts(bt, result["top5"], all_rows=result["all"], bench_curves=result["benchmark_curves"], sim=result["sim_account"])
+    charts = make_charts(bt, result["top5"], all_rows=result["all"], bench_curves=result["benchmark_curves"], sim=result["sim_account"], my=result["my_holdings"])
     def _img(key, alt):
         return f'<div class="chart"><img src="data:image/png;base64,{charts[key]}" alt="{alt}"/></div>' if key in charts else ""
     if bt:
@@ -702,6 +833,26 @@ def main():
         missing_html += "<p class='warn'>数据缺失（已剔除当日评选，不编造价格）：" + "、".join([m["code"] for m in missing]) + "</p>"
     if index_missing:
         missing_html += "<p class='warn'>指数基准数据缺失（累计对比中该指数暂不显示，不编造价格）：" + "、".join([m["code"] + " " + m["label"] for m in index_missing]) + "</p>"
+    my = result["my_holdings"]
+    my_html = ""
+    if my and my.get("rows"):
+        my_rows_html = "".join([f"<tr><td><b>{r['code']}</b></td><td>{r['name']}</td><td>{r['market']}</td><td>{r['buy_date']}</td><td>{r['shares']:,.0f}</td><td>{r['buy_price']}</td><td>{r['price']}</td><td>{r['value']:,.2f} {r['currency']}</td><td class='{cls_pct(r['pnl_pct'])}'>{r['pnl']:+,.2f} {r['currency']}</td><td class='{cls_pct(r['pnl_pct'])}'>{fmt_pct(r['pnl_pct'])}</td><td>{r['weight']*100:.1f}%</td><td>{r['days']}</td></tr>" for r in my["rows"]])
+        my_warn = ""
+        if my.get("simulated"):
+            my_warn += "<p class='warn'>模拟数据演示，非真实持仓：下面是演示用的持仓，改仓库里的 holdings.json（代码、市场、买入日期、数量、买入价）后，Actions 下次运行会自动换成你的持仓。</p>"
+        if my.get("cached"):
+            my_warn += "<p class='warn'>本次抓取失败、已用上次缓存兜底：" + "、".join([c["code"] + "（缓存至" + c["last"] + "）" for c in my["cached"]]) + "</p>"
+        if my.get("missing"):
+            my_warn += "<p class='warn'>持仓数据缺失（已剔除，不编造价格）：" + "、".join([m["code"] for m in my["missing"]]) + "</p>"
+        my_html = f"""<div class="card"><h2>我的持仓（买入以来）</h2>{my_warn}<p class="muted">口径：单只盈亏率 = 最新价 / 成本价 - 1；组合曲线按成本加权（港币按 {my['hkd_cny']} 人民币/港元折算，买入前按成本价计）；A股与港股交易日不同，曲线按日历对齐、缺失日用前一收盘价顺延。持仓期：{my['start_date']} 至 {my['end_date']}。</p>
+    <div class="kpi-grid kpi-grid-4">
+      <div class="kpi"><div class="kpi-label">总成本（折人民币）</div><div class="kpi-value">{my['total_cost_cny']:,.2f} 元</div><div class="muted">港币按 {my['hkd_cny']} 折算</div></div>
+      <div class="kpi"><div class="kpi-label">总市值（折人民币）</div><div class="kpi-value">{my['total_value_cny']:,.2f} 元</div><div class="muted">按最新收盘价</div></div>
+      <div class="kpi"><div class="kpi-label">累计盈亏（折人民币）</div><div class="kpi-value {cls_pct(my['total_pnl_pct'])}">{my['total_pnl_cny']:+,.2f} 元（{fmt_pct(my['total_pnl_pct'])}）</div><div class="muted">买入以来，未扣交易费用</div></div>
+      <div class="kpi"><div class="kpi-label">组合最大回撤</div><div class="kpi-value">{fmt_pct(my['max_dd'])}</div><div class="muted">组合曲线最高点以来</div></div>
+    </div>
+    <div class="table-wrap"><table class="data"><tr><th>代码</th><th>名称</th><th>市场</th><th>买入日期</th><th>数量（股）</th><th>成本价</th><th>最新价</th><th>市值</th><th>盈亏额</th><th>盈亏率</th><th>仓位</th><th>天数</th></tr>{my_rows_html}</table></div>
+    {_img('my_curve', '我的持仓收益走势')}{_img('my_pnl', '我的持仓单只盈亏率')}</div>"""
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>A股ETF每日看板 {result['as_of']}</title>
     <style>
@@ -748,6 +899,7 @@ def main():
     <div class="table-wrap"><table class="data"><tr><th>代码</th><th>名称</th><th>数量（份）</th><th>成本价</th><th>最新价</th><th>市值</th><th>盈亏额</th><th>盈亏率</th><th>仓位</th><th>天数</th></tr>{''.join([f"<tr><td><b>{h['code']}</b></td><td>{next((t['name'] for t in result['all'] if t['code']==h['code']), h['code'])}</td><td>{h['shares']:,.2f}</td><td>{h['cost']}</td><td>{h['price']}</td><td>{h['value']:,.2f}</td><td class='{cls_pct(h['pnl_pct'])}'>{h['pnl']:+,.2f}</td><td class='{cls_pct(h['pnl_pct'])}'>{fmt_pct(h['pnl_pct'])}</td><td>{h['weight']*100:.1f}%</td><td>{h['days']}</td></tr>" for h in result['sim_account']['holdings']]) if result['sim_account'] else ''}</table></div>
     <p class="muted">注：持仓盈亏仅为当前持仓未实现部分；累计盈亏还包括历史已卖出持仓的实现盈亏与调仓成本，两者不等是正常的。</p>
     {_img('sim_assets', '模拟账户总资产走势')}</div>
+    {my_html}
     <div class="card"><h2>持仓概览</h2><p class="muted">按综合评分排序；买入优先、持有补足，卖出/规避标的不入选；买入+持有不足5只时，TOP5如实少于5只。评分构成：趋势30 + 动量30 + 强度20 + 稳定20。</p>
     <div class="table-wrap"><table class="data"><tr><th>代码</th><th>名称</th><th>权重</th><th>收盘价</th><th>5日</th><th>20日</th><th>60日</th><th>RSI</th><th>评分</th><th>信号</th></tr>{''.join([f"<tr><td><b>{t['code']}</b></td><td>{t['name']}</td><td>{100/len(result['top5']):.0f}%</td><td>{t['price']}</td><td class='{cls_pct(t['ret5'])}'>{fmt_pct(t['ret5'])}</td><td class='{cls_pct(t['ret20'])}'>{fmt_pct(t['ret20'])}</td><td class='{cls_pct(t['ret60'])}'>{fmt_pct(t['ret60'])}</td><td>{t['rsi'] if t['rsi'] is not None else '—'}</td><td><b>{t['score']}</b></td><td><span class='sig {'buy' if t['signal']=='买入' else 'hold'}'>{t['signal']}</span></td></tr>" for t in result['top5']])}</table></div>
     {_img('top5', 'TOP5综合评分')}</div>
