@@ -73,17 +73,19 @@ INDEX_BENCHMARKS = [
 ]
 COST = 0.0003  # 单边调仓成本（按换仓比例计）
 
-def fetch_one(session, secid):
+def fetch_one(session, secid, beg=None, end=None):
     today = date.today()
-    beg = (today - timedelta(days=1100)).strftime("%Y%m%d")
-    end = today.strftime("%Y%m%d")
+    if beg is None:
+        beg = (today - timedelta(days=1100)).strftime("%Y%m%d")
+    if end is None:
+        end = today.strftime("%Y%m%d")
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {"secid": secid, "klt": "101", "fqt": "1", "beg": beg, "end": end,
               "fields1": "f1,f2,f3,f4,f5", "fields2": "f51,f52,f53,f54,f55,f56,f57"}
     last_err = None
-    for attempt in range(4):
+    for attempt in range(3):
         try:
-            r = session.get(url, params=params, timeout=25)
+            r = session.get(url, params=params, timeout=20)
             j = r.json()
             d = j.get("data") or {}
             klines = d.get("klines") or []
@@ -103,6 +105,39 @@ def fetch_one(session, secid):
             last_err = e
             time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"fetch failed {secid}: {last_err}")
+
+def merge_history(old_df, new_df):
+    """增量合并：旧缓存 + 新窗口。
+    前复权下分红/拆股会改变历史价：用重叠日的收盘价中位数比把旧价缩放到新复权口径，
+    再去掉旧表中与新窗口重叠的行、追加新行、按日期去重排序。"""
+    old = old_df.copy()
+    new = new_df.copy()
+    old["date"] = pd.to_datetime(old["date"])
+    new["date"] = pd.to_datetime(new["date"])
+    common = pd.merge(old[["date", "close"]], new[["date", "close"]], on="date", suffixes=("_old", "_new"))
+    common = common[(common["close_old"] != 0) & (common["close_new"] != 0)]
+    if len(common):
+        scale = float((common["close_new"] / common["close_old"]).median())
+        if 0.2 <= scale <= 5.0 and abs(scale - 1.0) > 1e-6:
+            for c in ("open", "close", "high", "low"):
+                if c in old.columns:
+                    old[c] = old[c] * scale
+    merged = pd.concat([old[old["date"] < new["date"].min()], new], ignore_index=True)
+    merged = merged.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    return merged
+
+def fetch_incremental(session, secid, cache_path):
+    """有缓存时只拉增量：从缓存最后日期前5天拉到今天，合并后返回。
+    无缓存时走全量。增量拉取失败时抛错，调用方按原有逻辑走纯缓存兜底。"""
+    if not os.path.exists(cache_path):
+        return fetch_one(session, secid)
+    old = pd.read_csv(cache_path, parse_dates=["date"])
+    if old.empty:
+        return fetch_one(session, secid)
+    last = pd.to_datetime(old["date"]).max().date()
+    beg = (last - timedelta(days=5)).strftime("%Y%m%d")
+    new_df, name = fetch_one(session, secid, beg=beg)
+    return merge_history(old, new_df), name
 
 def rsi_series(close, period=14):
     delta = close.diff()
@@ -462,7 +497,7 @@ def compute_my_holdings(session):
             currency = "CNY"
         cache_path = os.path.join(DATA_DIR, f"hold_{code}.csv")
         try:
-            df, real_name = fetch_one(session, secid)
+            df, real_name = fetch_incremental(session, secid, cache_path)
             df.to_csv(cache_path, index=False)
             print(f"MY OK {code} {real_name} rows={len(df)} last={df.iloc[-1]['date'].date()} close={df.iloc[-1]['close']}")
         except Exception as ex:
@@ -665,11 +700,11 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
     session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
+    session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/", "Accept": "application/json, text/plain, */*"})
     frames, meta, missing, cached = {}, {}, [], []
     for secid, code, label in POOL:
         try:
-            df, real_name = fetch_one(session, secid)
+            df, real_name = fetch_incremental(session, secid, os.path.join(DATA_DIR, f"{code}.csv"))
             df = add_indicators(df)
             frames[code] = df
             meta[code] = {"secid": secid, "label": label, "real_name": real_name}
@@ -726,7 +761,7 @@ def main():
     index_frames, index_missing = {}, []
     for secid, icode, iname in INDEX_BENCHMARKS:
         try:
-            idf, ireal = fetch_one(session, secid)
+            idf, ireal = fetch_incremental(session, secid, os.path.join(DATA_DIR, f"index_{icode}.csv"))
             index_frames[icode] = idf
             idf.to_csv(os.path.join(DATA_DIR, f"index_{icode}.csv"), index=False)
             print(f"INDEX OK {icode} {ireal} rows={len(idf)} last={idf.iloc[-1]['date'].date()} close={idf.iloc[-1]['close']}")
