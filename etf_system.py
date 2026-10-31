@@ -469,7 +469,7 @@ def compute_my_holdings(session):
             if os.path.exists(cache_path):
                 try:
                     df = pd.read_csv(cache_path, parse_dates=["date"])
-                    real_name = e.get("name", code)
+                    real_name = e.get("name") or {"600519": "贵州茅台", "00700": "腾讯控股", "600036": "招商银行"}.get(code, code)
                     cached.append({"code": code, "label": market, "last": str(df.iloc[-1]['date'].date())})
                     print(f"MY CACHED {code} rows={len(df)} last={df.iloc[-1]['date'].date()}")
                 except Exception as ce:
