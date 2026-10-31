@@ -8,6 +8,7 @@ A股ETF 每日跟踪 / TOP5 信号 / 回测系统 v1
 """
 import argparse, base64, io, json, math, os, sys, time
 from datetime import date, timedelta
+import datetime
 import requests
 import pandas as pd
 import numpy as np
@@ -138,6 +139,117 @@ def fetch_incremental(session, secid, cache_path):
     beg = (last - timedelta(days=5)).strftime("%Y%m%d")
     new_df, name = fetch_one(session, secid, beg=beg)
     return merge_history(old, new_df), name
+
+def _df_from_ohlcv(rows):
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").reset_index(drop=True)
+
+def fetch_sina(session, sina_symbol, datalen=1000):
+    """新浪日K：http，A股ETF/指数可用；返回不复权价，成交量为股数（调用方按需折算）。"""
+    url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    params = {"symbol": sina_symbol, "scale": "240", "ma": "no", "datalen": str(datalen)}
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = session.get(url, params=params, timeout=20)
+            data = r.json()
+            if not data:
+                raise ValueError(f"empty sina klines for {sina_symbol}: {r.text[:120]}")
+            rows = []
+            for d in data:
+                vol_shares = float(d["volume"])
+                close = float(d["close"])
+                rows.append({"date": d["day"], "open": float(d["open"]), "close": close,
+                             "high": float(d["high"]), "low": float(d["low"]),
+                             "volume": vol_shares / 100.0, "amount": close * vol_shares})
+            return _df_from_ohlcv(rows)
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"sina fetch failed {sina_symbol}: {last_err}")
+
+def fetch_yahoo(session, yahoo_symbol, start_date=None, end_date=None):
+    """Yahoo日K：http，无需token；A股/港股可用，沪深300指数历史不可用（调用方不要用它拉000300）。"""
+    import time as _time
+    today = date.today()
+    if end_date is None:
+        end_date = today
+    if start_date is None:
+        start_date = today - timedelta(days=1100)
+    p1 = int(_time.mktime(datetime.datetime.combine(start_date, datetime.time.min).timetuple()))
+    p2 = int(_time.mktime(datetime.datetime.combine(end_date + timedelta(days=1), datetime.time.min).timetuple()))
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+    params = {"period1": p1, "period2": p2, "interval": "1d"}
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = session.get(url, params=params, timeout=20)
+            j = r.json()
+            res = (j.get("chart") or {}).get("result")
+            if not res:
+                raise ValueError(f"empty yahoo chart for {yahoo_symbol}: {r.text[:120]}")
+            res = res[0]
+            ts = res["timestamp"]
+            q = res["indicators"]["quote"][0]
+            rows = []
+            for i, ts_i in enumerate(ts):
+                c = q["close"][i]
+                if c is None:
+                    continue
+                vol_shares = float(q["volume"][i] or 0)
+                # A股：Yahoo成交量为股数，折算为东方财富的手（100股）以保持量比口径；港股在调用方单独处理
+                rows.append({"date": datetime.datetime.fromtimestamp(ts_i, tz=datetime.timezone(datetime.timedelta(hours=8))).date().isoformat(),
+                             "open": float(q["open"][i] or c), "close": float(c),
+                             "high": float(q["high"][i] or c), "low": float(q["low"][i] or c),
+                             "volume": vol_shares, "amount": float(c) * vol_shares})
+            if not rows:
+                raise ValueError(f"empty yahoo rows for {yahoo_symbol}")
+            return _df_from_ohlcv(rows)
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"yahoo fetch failed {yahoo_symbol}: {last_err}")
+
+def fetch_with_fallback(session, secid, code, fallback_name, cache_path, sina_symbol=None, yahoo_symbol=None, is_hk=False):
+    """东方财富优先 -> 新浪（A股） -> Yahoo（港股及A股第二备选） -> 抛错（调用方走纯缓存）。
+    返回 (df, name, source)，source 为 eastmoney / sina / yahoo。
+    备选只追加近期行：有缓存时新浪取60行、Yahoo取缓存最后35天至今，与缓存合并；无缓存时取全量。"""
+    try:
+        df, name = fetch_incremental(session, secid, cache_path)
+        return df, (name or fallback_name), "eastmoney"
+    except Exception as em_err:
+        last_err = em_err
+        # 新浪：仅A股
+        if sina_symbol and not is_hk:
+            try:
+                if os.path.exists(cache_path):
+                    old = pd.read_csv(cache_path, parse_dates=["date"])
+                    if not old.empty:
+                        new_df = fetch_sina(session, sina_symbol, datalen=60)
+                        return merge_history(old, new_df), fallback_name, "sina"
+                df = fetch_sina(session, sina_symbol, datalen=1000)
+                return df, fallback_name, "sina"
+            except Exception as e:
+                last_err = e
+        # Yahoo：港股直接用股数成交量；A股折算为手
+        if yahoo_symbol:
+            try:
+                if os.path.exists(cache_path):
+                    old = pd.read_csv(cache_path, parse_dates=["date"])
+                    if not old.empty:
+                        last = pd.to_datetime(old["date"]).max().date()
+                        new_df = fetch_yahoo(session, yahoo_symbol, start_date=last - timedelta(days=35))
+                        if not is_hk:
+                            new_df["volume"] = new_df["volume"] / 100.0
+                        return merge_history(old, new_df), fallback_name, "yahoo"
+                df = fetch_yahoo(session, yahoo_symbol)
+                if not is_hk:
+                    df["volume"] = df["volume"] / 100.0
+                return df, fallback_name, "yahoo"
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"all sources failed {code}: {last_err}")
 
 def rsi_series(close, period=14):
     delta = close.diff()
@@ -497,9 +609,14 @@ def compute_my_holdings(session):
             currency = "CNY"
         cache_path = os.path.join(DATA_DIR, f"hold_{code}.csv")
         try:
-            df, real_name = fetch_incremental(session, secid, cache_path)
+            _hk = (market == "港股通")
+            _fallback_name = e.get("name") or {"600519": "贵州茅台", "00700": "腾讯控股", "600036": "招商银行"}.get(code, code)
+            _sina = None if _hk else (("sh" if code.startswith("6") else "sz") + code)
+            # 港股Yahoo代码取后4位：00700 -> 0700.HK，09988 -> 9988.HK
+            _yahoo = f"{code[-4:]}.HK" if _hk else (f"{code}.SS" if code.startswith("6") else f"{code}.SZ")
+            df, real_name, _src = fetch_with_fallback(session, secid, code, _fallback_name, cache_path, sina_symbol=_sina, yahoo_symbol=_yahoo, is_hk=_hk)
             df.to_csv(cache_path, index=False)
-            print(f"MY OK {code} {real_name} rows={len(df)} last={df.iloc[-1]['date'].date()} close={df.iloc[-1]['close']}")
+            print(f"MY {_src.upper()} OK {code} {real_name} rows={len(df)} last={df.iloc[-1]['date'].date()} close={df.iloc[-1]['close']}")
         except Exception as ex:
             if os.path.exists(cache_path):
                 try:
@@ -704,12 +821,14 @@ def main():
     frames, meta, missing, cached = {}, {}, [], []
     for secid, code, label in POOL:
         try:
-            df, real_name = fetch_incremental(session, secid, os.path.join(DATA_DIR, f"{code}.csv"))
+            _sina = ("sh" if secid.startswith("1.") else "sz") + code
+            _yahoo = f"{code}.SS" if secid.startswith("1.") else f"{code}.SZ"
+            df, real_name, _src = fetch_with_fallback(session, secid, code, label, os.path.join(DATA_DIR, f"{code}.csv"), sina_symbol=_sina, yahoo_symbol=_yahoo)
             df = add_indicators(df)
             frames[code] = df
             meta[code] = {"secid": secid, "label": label, "real_name": real_name}
             df.to_csv(os.path.join(DATA_DIR, f"{code}.csv"), index=False)
-            print(f"OK {code} {real_name} rows={len(df)} last={df.iloc[-1]['date'].date()} close={df.iloc[-1]['close']}")
+            print(f"{_src.upper()} OK {code} {real_name} rows={len(df)} last={df.iloc[-1]['date'].date()} close={df.iloc[-1]['close']}")
         except Exception as e:
             # 抓取失败时用上次成功缓存兜底，避免单只 ETF 缺失导致全池排名与回测结果跳变
             cache_path = os.path.join(DATA_DIR, f"{code}.csv")
@@ -761,10 +880,12 @@ def main():
     index_frames, index_missing = {}, []
     for secid, icode, iname in INDEX_BENCHMARKS:
         try:
-            idf, ireal = fetch_incremental(session, secid, os.path.join(DATA_DIR, f"index_{icode}.csv"))
+            _sina = ("sh" if secid.startswith("1.") else "sz") + icode
+            _yahoo = f"{icode}.SS" if icode != "000300" else None
+            idf, ireal, _src = fetch_with_fallback(session, secid, icode, iname, os.path.join(DATA_DIR, f"index_{icode}.csv"), sina_symbol=_sina, yahoo_symbol=_yahoo)
             index_frames[icode] = idf
             idf.to_csv(os.path.join(DATA_DIR, f"index_{icode}.csv"), index=False)
-            print(f"INDEX OK {icode} {ireal} rows={len(idf)} last={idf.iloc[-1]['date'].date()} close={idf.iloc[-1]['close']}")
+            print(f"INDEX {_src.upper()} OK {icode} {ireal} rows={len(idf)} last={idf.iloc[-1]['date'].date()} close={idf.iloc[-1]['close']}")
         except Exception as e:
             cache_path = os.path.join(DATA_DIR, f"index_{icode}.csv")
             if os.path.exists(cache_path):
