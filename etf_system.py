@@ -127,6 +127,20 @@ def merge_history(old_df, new_df):
     merged = merged.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
     return merged
 
+def merge_fallback(old_df, new_df):
+    """备选源合并：绝不改写历史。只追加新源中晚于旧缓存最后日期的行，
+    重叠日一律保留旧（东方财富前复权）数据，避免新浪不复权分红缺口改写回测。
+    东方财富同源增量仍走 merge_history（同源复权口径变化时旧价需缩放）。"""
+    old = old_df.copy()
+    new = new_df.copy()
+    old["date"] = pd.to_datetime(old["date"])
+    new["date"] = pd.to_datetime(new["date"])
+    if old.empty:
+        return new.sort_values("date").reset_index(drop=True)
+    last = old["date"].max()
+    merged = pd.concat([old, new[new["date"] > last]], ignore_index=True)
+    return merged.sort_values("date").drop_duplicates(subset=["date"], keep="first").reset_index(drop=True)
+
 def fetch_incremental(session, secid, cache_path):
     """有缓存时只拉增量：从缓存最后日期前5天拉到今天，合并后返回。
     无缓存时走全量。增量拉取失败时抛错，调用方按原有逻辑走纯缓存兜底。"""
@@ -227,7 +241,7 @@ def fetch_with_fallback(session, secid, code, fallback_name, cache_path, sina_sy
                     old = pd.read_csv(cache_path, parse_dates=["date"])
                     if not old.empty:
                         new_df = fetch_sina(session, sina_symbol, datalen=60)
-                        return merge_history(old, new_df), fallback_name, "sina"
+                        return merge_fallback(old, new_df), fallback_name, "sina"
                 df = fetch_sina(session, sina_symbol, datalen=1000)
                 return df, fallback_name, "sina"
             except Exception as e:
@@ -242,7 +256,7 @@ def fetch_with_fallback(session, secid, code, fallback_name, cache_path, sina_sy
                         new_df = fetch_yahoo(session, yahoo_symbol, start_date=last - timedelta(days=35))
                         if not is_hk:
                             new_df["volume"] = new_df["volume"] / 100.0
-                        return merge_history(old, new_df), fallback_name, "yahoo"
+                        return merge_fallback(old, new_df), fallback_name, "yahoo"
                 df = fetch_yahoo(session, yahoo_symbol)
                 if not is_hk:
                     df["volume"] = df["volume"] / 100.0
