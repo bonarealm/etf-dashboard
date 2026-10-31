@@ -324,15 +324,15 @@ def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None, my=None):
     out["monthly"] = _png_b64(fig)
     # 4. TOP5 评分条形图
     if top5:
-        labels = [f"{t['code']} {t['name']}" for t in reversed(top5)]
+        labels = [f"{t['name']}" for t in reversed(top5)]
         scores = [t["score"] for t in reversed(top5)]
         colors = [NAVY if t["signal"] == "买入" else GOLD for t in reversed(top5)]
         fig, ax = plt.subplots(figsize=(10, 3.0))
         bars = ax.barh(labels, scores, color=colors, height=0.55)
         ax.set_xlim(0, 100)
         ax.axvline(70, color=RED_UP, linewidth=1.2, linestyle="--")
-        for bar, v in zip(bars, scores):
-            ax.text(v + 1.5, bar.get_y() + bar.get_height()/2, f"{v:.1f}分", va="center", fontsize=10, fontweight="bold", color=NAVY)
+        for bar, v, col in zip(bars, scores, colors):
+            ax.text(v - 2, bar.get_y() + bar.get_height()/2, f"{v:.1f}分", va="center", ha="right", fontsize=10, fontweight="bold", color="white" if col == NAVY else NAVY)
         _style_ax(ax, "TOP5 综合评分（虚线 = 70 分买入线）")
         out["top5"] = _png_b64(fig)
     # 5. 当日盈亏分布（1日涨幅，红涨绿跌）与累计盈亏分布（60日涨幅）
@@ -340,17 +340,20 @@ def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None, my=None):
         def _dist(rows, key, title):
             valid = [r for r in rows if r.get(key) is not None]
             valid = sorted(valid, key=lambda r: r[key])
-            labels = [f"{r['code']}" for r in valid]
+            labels = [f"{r['name']}" for r in valid]
             vals = [r[key] * 100 for r in valid]
             colors = [RED_UP if v >= 0 else GREEN_DN for v in vals]
             fig, ax = plt.subplots(figsize=(5.2, 5.0))
             ax.barh(labels, vals, color=colors, height=0.6)
             ax.axvline(0, color="#344054", linewidth=1)
+            _rng = (max(vals) - min(vals)) if len(vals) > 1 else 10
+            ax.set_xlim(min(vals) - _rng * 0.35, max(vals) + _rng * 0.35)
+            _off = _rng * 0.02
             for i, v in enumerate(vals):
-                ax.text(v + (0.15 if v >= 0 else -0.15), i, f"{v:+.2f}%", va="center",
+                ax.text(v + (_off if v >= 0 else -_off), i, f"{v:+.2f}%", va="center",
                         ha="left" if v >= 0 else "right", fontsize=7.5, color="#1A2332")
             _style_ax(ax, title)
-            ax.tick_params(labelsize=8)
+            ax.tick_params(labelsize=7.5)
             return _png_b64(fig)
         out["daily"] = _dist(all_rows, "ret1", "当日涨幅分布（%）")
         out["cumulative"] = _dist(all_rows, "ret60", "60日累计涨幅分布（%）")
@@ -393,18 +396,21 @@ def make_charts(bt, top5, all_rows=None, bench_curves=None, sim=None, my=None):
         for i, r in enumerate(my["rows"]):
             rd = pd.to_datetime(r["curve_dates"])
             rv = np.array(r["curve_norm"], dtype=float)
-            ax.plot(rd, rv, color=_cols[i % len(_cols)], linewidth=1.4, label=f"{r['code']} {r['name']}（{r['pnl_pct']*100:+.2f}%）")
+            ax.plot(rd, rv, color=_cols[i % len(_cols)], linewidth=1.4, label=f"{r['name']}（{r['pnl_pct']*100:+.2f}%）")
         ax.axhline(100, color=GOLD, linewidth=1.2, linestyle="--")
         _style_ax(ax, "我的持仓收益走势（买入价 = 100，组合按成本加权）")
         ax.legend(frameon=False, fontsize=9, loc="best")
         out["my_curve"] = _png_b64(fig)
-        labels = [f"{r['code']}" for r in my["rows"]]
+        labels = [f"{r['name']}" for r in my["rows"]]
         vals = [r["pnl_pct"] * 100 for r in my["rows"]]
         fig, ax = plt.subplots(figsize=(10, 3.0))
         ax.barh(labels, vals, color=[RED_UP if v >= 0 else GREEN_DN for v in vals], height=0.55)
         ax.axvline(0, color="#344054", linewidth=1)
+        _rng = (max(vals) - min(vals)) if len(vals) > 1 else 10
+        ax.set_xlim(min(vals) - _rng * 0.35, max(vals) + _rng * 0.35)
+        _off = _rng * 0.02
         for i, v in enumerate(vals):
-            ax.text(v + (0.3 if v >= 0 else -0.3), i, f"{v:+.2f}%", va="center", ha="left" if v >= 0 else "right", fontsize=10, fontweight="bold", color=NAVY)
+            ax.text(v + (_off if v >= 0 else -_off), i, f"{v:+.2f}%", va="center", ha="left" if v >= 0 else "right", fontsize=10, fontweight="bold", color=NAVY)
         _style_ax(ax, "我的持仓单只盈亏率（买入以来，%）")
         out["my_pnl"] = _png_b64(fig)
     # 7. 超额收益曲线：策略净值 - 沪深300ETF净值（百分点，红正蓝负）
